@@ -46,6 +46,21 @@ enum MatchConfidence: Int, Comparable {
     }
 }
 
+enum WeddingCategory: String, CaseIterable, Identifiable, Codable {
+    case none = "Geen categorie"
+    case refo = "Refo"
+    case christelijk = "Christelijk"
+    case romantischLicht = "Romantisch-licht"
+    case boerenbruiloft = "Boerenbruiloft"
+    case lichtFeestelijk = "Licht en feestelijk"
+
+    var id: String { rawValue }
+
+    var folderName: String? {
+        self == .none ? nil : rawValue
+    }
+}
+
 struct LibraryEntry: Identifiable, Hashable {
     let id = UUID()
     let url: URL
@@ -605,7 +620,10 @@ enum OutputWriter {
         var confidence: MatchConfidence
     }
 
-    static func write(projects: [ProjectScan]) throws -> [ExportResult] {
+    static func write(
+        projects: [ProjectScan],
+        categories: [UUID: WeddingCategory]
+    ) throws -> [ExportResult] {
         let groups = Dictionary(grouping: projects) { $0.volumeRoot.standardizedFileURL.path }
         var results: [ExportResult] = []
 
@@ -617,19 +635,36 @@ enum OutputWriter {
             try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
 
             let mostUsed = output.appendingPathComponent("00 - Meest gebruikt", isDirectory: true)
-            let unknown = output.appendingPathComponent("04 - Positie onbekend", isDirectory: true)
+            let categoryRoot = output.appendingPathComponent("Categorieën", isDirectory: true)
             let report = output.appendingPathComponent("_Rapport", isDirectory: true)
+            let legacyUnknown = output.appendingPathComponent("04 - Positie onbekend", isDirectory: true)
 
-            for folder in [mostUsed, unknown, report] {
+            // Rebuild generated folders so old prefixed filenames do not linger.
+            for folder in [mostUsed, categoryRoot, report, legacyUnknown] {
                 if FileManager.default.fileExists(atPath: folder.path) {
                     try? FileManager.default.removeItem(at: folder)
                 }
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            }
+
+            try FileManager.default.createDirectory(at: mostUsed, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: categoryRoot, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: report, withIntermediateDirectories: true)
+
+            for category in WeddingCategory.allCases where category != .none {
+                if let folderName = category.folderName {
+                    try FileManager.default.createDirectory(
+                        at: categoryRoot.appendingPathComponent(folderName, isDirectory: true),
+                        withIntermediateDirectories: true
+                    )
+                }
             }
 
             var aggregates: [String: Aggregate] = [:]
+            var categoryAggregates: [WeddingCategory: [String: Aggregate]] = [:]
 
             for project in volumeProjects {
+                let category = categories[project.id] ?? .none
+
                 for track in project.tracks where track.confidence >= .medium {
                     var item = aggregates[track.normalizedKey] ?? Aggregate(
                         displayName: track.displayName,
@@ -643,6 +678,23 @@ enum OutputWriter {
                         item.sources.append(track.sourceURL)
                     }
                     aggregates[track.normalizedKey] = item
+
+                    if category != .none {
+                        var byTrack = categoryAggregates[category] ?? [:]
+                        var categoryItem = byTrack[track.normalizedKey] ?? Aggregate(
+                            displayName: track.displayName,
+                            sources: [],
+                            projectIDs: [],
+                            confidence: track.confidence
+                        )
+                        categoryItem.projectIDs.insert(project.id)
+                        categoryItem.confidence = max(categoryItem.confidence, track.confidence)
+                        if !categoryItem.sources.contains(track.sourceURL) {
+                            categoryItem.sources.append(track.sourceURL)
+                        }
+                        byTrack[track.normalizedKey] = categoryItem
+                        categoryAggregates[category] = byTrack
+                    }
                 }
             }
 
@@ -654,26 +706,55 @@ enum OutputWriter {
             }
 
             var copied = 0
-            var csv = "Rang;Track;Projecten;Confidence;Bron\n"
+            var csv = "Rang;Track;Projecten;Confidence;Bron;Categorieën\n"
 
             for (index, aggregate) in ranked.enumerated() {
                 guard let source = aggregate.sources.first(where: {
                     FileManager.default.fileExists(atPath: $0.path)
                 }) else { continue }
 
-                let rank = index + 1
-                let count = aggregate.projectIDs.count
-                let base = safeName(source.deletingPathExtension().lastPathComponent)
-                let fileName = String(format: "%03d__%02dx__%@.%@", rank, count, base, source.pathExtension)
-
-                let mainDestination = mostUsed.appendingPathComponent(fileName)
-                let unknownDestination = unknown.appendingPathComponent(fileName)
-
-                try copyReplacing(source: source, destination: mainDestination)
-                try copyReplacing(source: source, destination: unknownDestination)
+                // Keep the original audio filename exactly as-is.
+                let destination = mostUsed.appendingPathComponent(source.lastPathComponent)
+                try copyIfMissing(source: source, destination: destination)
                 copied += 1
 
-                csv += "\(rank);\(csvEscape(aggregate.displayName));\(count);\(aggregate.confidence.label);\(csvEscape(source.path))\n"
+                let trackCategories = WeddingCategory.allCases
+                    .filter { category in
+                        guard category != .none,
+                              let byTrack = categoryAggregates[category]
+                        else { return false }
+                        return byTrack.keys.contains(where: { key in
+                            aggregates[key]?.displayName == aggregate.displayName
+                        })
+                    }
+                    .map(\.rawValue)
+                    .joined(separator: ", ")
+
+                csv += [
+                    String(index + 1),
+                    csvEscape(aggregate.displayName),
+                    String(aggregate.projectIDs.count),
+                    aggregate.confidence.label,
+                    csvEscape(source.path),
+                    csvEscape(trackCategories)
+                ].joined(separator: ";") + "\n"
+            }
+
+            // Category folders contain the same original filenames, never ranked/prefixed names.
+            for category in WeddingCategory.allCases where category != .none {
+                guard let folderName = category.folderName,
+                      let byTrack = categoryAggregates[category]
+                else { continue }
+
+                let categoryFolder = categoryRoot.appendingPathComponent(folderName, isDirectory: true)
+                for aggregate in byTrack.values {
+                    guard let source = aggregate.sources.first(where: {
+                        FileManager.default.fileExists(atPath: $0.path)
+                    }) else { continue }
+
+                    let destination = categoryFolder.appendingPathComponent(source.lastPathComponent)
+                    try copyIfMissing(source: source, destination: destination)
+                }
             }
 
             try csv.write(
@@ -682,14 +763,16 @@ enum OutputWriter {
                 encoding: .utf8
             )
 
-            var projectCSV = "Library;Event;Project;Tracks gevonden;Versie-hint;Database\n"
+            var projectCSV = "Library;Event;Project;Categorie;Tracks gevonden;Versie-hint;Database\n"
             for project in volumeProjects.sorted(by: {
                 $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending
             }) {
+                let category = categories[project.id] ?? .none
                 projectCSV += [
                     csvEscape(project.libraryName),
                     csvEscape(project.eventName),
                     csvEscape(project.projectName),
+                    csvEscape(category.rawValue),
                     String(project.likelyMusicCount),
                     csvEscape(project.versionHint),
                     csvEscape(project.databaseURL.path)
@@ -707,11 +790,12 @@ enum OutputWriter {
 
             Deze map is gegenereerd uit \(volumeProjects.count) geselecteerde Final Cut Pro-projecten.
 
-            BELANGRIJK:
+            Audio-bestandsnamen blijven origineel. Gebruiksaantallen staan alleen in het CSV-rapport.
+            Projectcategorieën worden vertaald naar mappen onder 'Categorieën'.
+            Een track kan in meerdere categorieën terechtkomen als hij in verschillend gelabelde projecten gebruikt is.
+
             De app leest .fcpbundle libraries read-only.
-            De interne CurrentVersion.fcpevent database is wel SQLite, maar Apple's schema is niet publiek gedocumenteerd.
-            Daarom is de directe bundle-scan geschikt voor projectniveau + gebruikstelling, maar wordt timelinevolgorde
-            nog niet als opener/midden/einde gepresenteerd totdat die volgorde betrouwbaar kan worden bepaald.
+            Expliciet uitgeschakelde/muted tracks worden waar de FCP-database dit herkenbaar opslaat overgeslagen.
 
             Bronvolume: \(volumeRoot.path)
             """
@@ -734,17 +818,13 @@ enum OutputWriter {
         return results.sorted { $0.volumeRoot.path < $1.volumeRoot.path }
     }
 
-    private static func copyReplacing(source: URL, destination: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: destination.path) {
-            try fm.removeItem(at: destination)
+    private static func copyIfMissing(source: URL, destination: URL) throws {
+        // The user explicitly wants untouched/original filenames.
+        // If the same filename already exists, keep the first copy rather than rename it.
+        if FileManager.default.fileExists(atPath: destination.path) {
+            return
         }
-        try fm.copyItem(at: source, to: destination)
-    }
-
-    private static func safeName(_ value: String) -> String {
-        let invalid = CharacterSet(charactersIn: "/:\n\r\t")
-        return value.components(separatedBy: invalid).joined(separator: "-")
+        try FileManager.default.copyItem(at: source, to: destination)
     }
 
     private static func csvEscape(_ value: String) -> String {
@@ -770,6 +850,7 @@ struct ContentView: View {
     @State private var libraries: [LibraryEntry] = []
     @State private var projects: [ProjectScan] = []
     @State private var selectedProjectIDs: Set<UUID> = []
+    @State private var projectCategories: [UUID: WeddingCategory] = [:]
     @State private var scanning = false
     @State private var exporting = false
     @State private var search = ""
@@ -827,7 +908,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("FCPX Music Miner")
                         .font(.system(size: 28, weight: .bold))
-                    Text("Vind je meest gebruikte trouwfilm-muziek per Final Cut-project.")
+                    Text("Scan je trouwfilms, selecteer projecten en bouw automatisch je eigen muziekcategorieën.")
                         .foregroundStyle(.secondary)
                 }
 
@@ -975,6 +1056,19 @@ struct ContentView: View {
 
                     Spacer()
 
+                    Picker("Categorie", selection: Binding(
+                        get: { projectCategories[project.id] ?? .none },
+                        set: { projectCategories[project.id] = $0 }
+                    )) {
+                        ForEach(WeddingCategory.allCases) { category in
+                            Text(category.rawValue).tag(category)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 165)
+                    .disabled(!selectedProjectIDs.contains(project.id))
+
                     VStack(alignment: .trailing, spacing: 2) {
                         Text("\(project.likelyMusicCount) tracks")
                             .fontWeight(.medium)
@@ -1073,6 +1167,7 @@ struct ContentView: View {
 
         projects = []
         selectedProjectIDs = []
+        projectCategories = [:]
         results = []
         status = "\(libraries.count) libraries klaar om te scannen."
     }
@@ -1098,8 +1193,9 @@ struct ContentView: View {
                     return $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending
                 }
                 selectedProjectIDs = Set(projects.map(\.id))
+                projectCategories = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, WeddingCategory.none) })
                 scanning = false
-                status = "\(projects.count) projecten gevonden. Vink nu versies uit die niet moeten meetellen."
+                status = "\(projects.count) projecten gevonden. Vink versies uit en kies per project een categorie."
             }
         }
     }
@@ -1135,7 +1231,7 @@ struct ContentView: View {
         Task {
             do {
                 let written = try await Task.detached(priority: .userInitiated) {
-                    try OutputWriter.write(projects: chosen)
+                    try OutputWriter.write(projects: chosen, categories: projectCategories)
                 }.value
 
                 await MainActor.run {
