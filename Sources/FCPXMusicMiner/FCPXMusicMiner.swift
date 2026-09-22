@@ -262,10 +262,41 @@ enum BundleScanner {
         return result
     }
 
+    private enum PlaybackState {
+        case active
+        case disabled
+        case unknown
+    }
+
+    private struct SQLiteColumn {
+        let name: String
+        let loweredName: String
+    }
+
+    private struct SQLiteTable {
+        let name: String
+        let columns: [SQLiteColumn]
+
+        var stateColumns: [SQLiteColumn] {
+            columns.filter { column in
+                let n = column.loweredName
+                return n.contains("enable")
+                    || n.contains("disable")
+                    || n.contains("active")
+                    || n.contains("audible")
+                    || n.contains("mute")
+            }
+        }
+    }
+
     private static func matchesInProject(databaseURL: URL, candidates: [URL]) -> [TrackMatch] {
         guard let data = try? Data(contentsOf: databaseURL, options: [.mappedIfSafe]) else {
             return []
         }
+
+        // Load the schema once per project. We still use the fast raw database scan
+        // to discover references, then consult SQLite only for tracks that were found.
+        let tables = sqliteTables(in: databaseURL)
 
         var result: [TrackMatch] = []
         var seen: Set<String> = []
@@ -280,6 +311,17 @@ enum BundleScanner {
             let key = normalizedTrackKey(fileName)
             guard seen.insert(key).inserted else { continue }
 
+            // Final Cut can keep old/disabled clips in the project database.
+            // Skip a track only when SQLite gives us explicit evidence that all
+            // matching timeline/component rows are disabled or muted.
+            let state = playbackState(
+                databaseURL: databaseURL,
+                tables: tables,
+                fileName: fileName,
+                stem: stem
+            )
+            guard state != .disabled else { continue }
+
             result.append(
                 TrackMatch(
                     sourceURL: candidate,
@@ -291,6 +333,220 @@ enum BundleScanner {
         }
 
         return result.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private static func sqliteTables(in databaseURL: URL) -> [SQLiteTable] {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/sqlite3") else { return [] }
+
+        let sql = "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL;"
+        guard let rows = sqliteJSON(databaseURL: databaseURL, sql: sql) else { return [] }
+
+        var result: [SQLiteTable] = []
+
+        for row in rows {
+            guard let tableName = row["name"] as? String,
+                  let createSQL = row["sql"] as? String
+            else { continue }
+
+            let columns = parseColumnNames(fromCreateSQL: createSQL).map {
+                SQLiteColumn(name: $0, loweredName: $0.lowercased())
+            }
+
+            if !columns.isEmpty {
+                result.append(SQLiteTable(name: tableName, columns: columns))
+            }
+        }
+
+        return result
+    }
+
+    private static func parseColumnNames(fromCreateSQL sql: String) -> [String] {
+        guard let open = sql.firstIndex(of: "("),
+              let close = sql.lastIndex(of: ")"),
+              open < close
+        else { return [] }
+
+        let body = String(sql[sql.index(after: open)..<close])
+        let parts = splitSQLColumns(body)
+        var columns: [String] = []
+
+        for part in parts {
+            let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            let upper = trimmed.uppercased()
+
+            if upper.hasPrefix("PRIMARY ")
+                || upper.hasPrefix("UNIQUE ")
+                || upper.hasPrefix("CONSTRAINT ")
+                || upper.hasPrefix("FOREIGN ")
+                || upper.hasPrefix("CHECK ")
+            {
+                continue
+            }
+
+            if trimmed.hasPrefix("\"") {
+                let rest = trimmed.dropFirst()
+                if let quote = rest.firstIndex(of: "\"") {
+                    columns.append(String(rest[..<quote]))
+                }
+            } else if trimmed.hasPrefix("[") {
+                let rest = trimmed.dropFirst()
+                if let bracket = rest.firstIndex(of: "]") {
+                    columns.append(String(rest[..<bracket]))
+                }
+            } else if let token = trimmed.split(whereSeparator: { $0.isWhitespace }).first {
+                columns.append(String(token).trimmingCharacters(in: CharacterSet(charactersIn: "\`")))
+            }
+        }
+
+        return columns
+    }
+
+    private static func splitSQLColumns(_ value: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var depth = 0
+        var inSingleQuote = false
+        var inDoubleQuote = false
+
+        for ch in value {
+            if ch == "'" && !inDoubleQuote {
+                inSingleQuote.toggle()
+            } else if ch == "\"" && !inSingleQuote {
+                inDoubleQuote.toggle()
+            } else if !inSingleQuote && !inDoubleQuote {
+                if ch == "(" { depth += 1 }
+                if ch == ")" { depth = max(0, depth - 1) }
+                if ch == "," && depth == 0 {
+                    result.append(current)
+                    current = ""
+                    continue
+                }
+            }
+            current.append(ch)
+        }
+
+        if !current.isEmpty {
+            result.append(current)
+        }
+        return result
+    }
+
+    private static func playbackState(
+        databaseURL: URL,
+        tables: [SQLiteTable],
+        fileName: String,
+        stem: String
+    ) -> PlaybackState {
+        guard !tables.isEmpty else { return .unknown }
+
+        var sawDisabled = false
+        var sawActive = false
+
+        for table in tables {
+            let stateColumns = table.stateColumns
+            guard !stateColumns.isEmpty else { continue }
+
+            // Searching every column is intentional: FCP may store the media reference
+            // in an opaque text/blob field while the enabled flag sits in the same row.
+            let searchable = table.columns.prefix(80)
+            guard !searchable.isEmpty else { continue }
+
+            let fileLiteral = sqlString(fileName.lowercased())
+            let stemLiteral = sqlString(stem.lowercased())
+            let whereParts = searchable.map { column in
+                let q = quoteIdentifier(column.name)
+                return "(instr(lower(CAST(\(q) AS TEXT)), \(fileLiteral)) > 0 OR instr(lower(CAST(\(q) AS TEXT)), \(stemLiteral)) > 0)"
+            }
+
+            let selectedStateColumns = stateColumns.map { quoteIdentifier($0.name) }.joined(separator: ", ")
+            let sql = "SELECT \(selectedStateColumns) FROM \(quoteIdentifier(table.name)) WHERE \(whereParts.joined(separator: " OR ")) LIMIT 50;"
+
+            guard let rows = sqliteJSON(databaseURL: databaseURL, sql: sql) else { continue }
+
+            for row in rows {
+                var rowDisabled = false
+                var rowActive = false
+
+                for column in stateColumns {
+                    guard let raw = row[column.name] else { continue }
+                    let truth = sqliteTruth(raw)
+                    guard let truth else { continue }
+
+                    let n = column.loweredName
+                    if n.contains("disable") || n.contains("mute") {
+                        if truth { rowDisabled = true }
+                    } else if n.contains("enable") || n.contains("active") || n.contains("audible") {
+                        if truth {
+                            rowActive = true
+                        } else {
+                            rowDisabled = true
+                        }
+                    }
+                }
+
+                if rowActive { sawActive = true }
+                if rowDisabled { sawDisabled = true }
+            }
+        }
+
+        // If a song has both an old disabled instance and a live active instance,
+        // it still belongs in the project.
+        if sawActive { return .active }
+        if sawDisabled { return .disabled }
+        return .unknown
+    }
+
+    private static func sqliteJSON(databaseURL: URL, sql: String) -> [[String: Any]]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = ["-readonly", "-json", databaseURL.path, sql]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard !data.isEmpty,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else {
+                return []
+            }
+            return object
+        } catch {
+            return nil
+        }
+    }
+
+    private static func sqliteTruth(_ value: Any) -> Bool? {
+        if let number = value as? NSNumber {
+            return number.doubleValue != 0
+        }
+        if let string = value as? String {
+            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "1", "true", "yes", "on", "enabled", "active":
+                return true
+            case "0", "false", "no", "off", "disabled", "inactive", "":
+                return false
+            default:
+                if let number = Double(string) {
+                    return number != 0
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func quoteIdentifier(_ value: String) -> String {
+        "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    private static func sqlString(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
     }
 
     private static func contains(text: String, in data: Data) -> Bool {
@@ -640,7 +896,7 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
 
-            Text("De app wijzigt nooit iets in een Final Cut-library.")
+            Text("De app wijzigt nooit iets in een Final Cut-library. Expliciet uitgeschakelde/muted tracks worden overgeslagen.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
