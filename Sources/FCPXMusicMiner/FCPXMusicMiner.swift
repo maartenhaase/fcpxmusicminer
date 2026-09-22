@@ -394,7 +394,7 @@ enum BundleScanner {
                     columns.append(String(rest[..<bracket]))
                 }
             } else if let token = trimmed.split(whereSeparator: { $0.isWhitespace }).first {
-                columns.append(String(token).trimmingCharacters(in: CharacterSet(charactersIn: "\`")))
+                columns.append(String(token).trimmingCharacters(in: CharacterSet(charactersIn: "`")))
             }
         }
 
