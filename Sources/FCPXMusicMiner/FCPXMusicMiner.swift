@@ -492,8 +492,8 @@ enum OutputWriter {
     }
 
     private static func csvEscape(_ value: String) -> String {
-        if value.contains(";") || value.contains(""") || value.contains("\n") {
-            return """ + value.replacingOccurrences(of: """, with: """") + """
+        if value.contains(";") || value.contains("\"") || value.contains("\n") {
+            return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
         }
         return value
     }
