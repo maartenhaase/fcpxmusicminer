@@ -24,9 +24,9 @@ cd src
 tar xzf ../source.tar.gz
 
 xcodebuild -project SmartSelects.xcodeproj -target SmartSelectsHost \
-  -configuration Release -sdk macosx -derivedDataPath "$WORK/build" \
+  -configuration Release -sdk macosx SYMROOT="$WORK/build" \
   ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-APP="$WORK/build/Build/Products/Release/SmartSelects.app"
+APP="$WORK/build/Release/SmartSelects.app"
 if [ ! -d "$APP/Contents/PlugIns/SmartSelectsFCP.appex" ]; then
   echo "Build mislukt: de Final Cut Pro-extensie ontbreekt."
   exit 1
