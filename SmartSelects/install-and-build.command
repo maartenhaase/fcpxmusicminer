@@ -28,13 +28,13 @@ python3 - <<'PY'
 from pathlib import Path
 p = Path("SmartSelects.xcodeproj/project.pbxproj")
 s = p.read_text()
-s = s.replace(r'\\"-O\\"', '-O')
-s = s.replace(r'\\"Apple Development\\"', 'Apple Development')
-s = s.replace(r'\\"$(inherited) @executable_path/../Frameworks\\"', '$(inherited) @executable_path/../Frameworks')
-s = s.replace(r'\\"$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks\\"', '$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks')
+q = chr(92) + '"'
+for value in ['-O', 'Apple Development',
+              '$(inherited) @executable_path/../Frameworks',
+              '$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks']:
+    s = s.replace(q + value + q, value)
 p.write_text(s)
 PY
-
 xcodebuild -project SmartSelects.xcodeproj -target SmartSelectsHost \
   -configuration Release -sdk macosx SYMROOT="$WORK/build" \
   ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
